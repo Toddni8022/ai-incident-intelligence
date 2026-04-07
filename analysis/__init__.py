@@ -6,6 +6,9 @@ from analysis.structured_incident_llm import (
     analyze_event_extractor_payload,
     analyze_log_file,
     analyze_parsed_logs,
+    analyze_parsed_logs_with_grounding,
+    completion_json,
+    structured_incident_from_llm_dict,
 )
 
 __all__ = [
@@ -15,4 +18,7 @@ __all__ = [
     "analyze_log_file",
     "analyze_logs",
     "analyze_parsed_logs",
+    "analyze_parsed_logs_with_grounding",
+    "completion_json",
+    "structured_incident_from_llm_dict",
 ]

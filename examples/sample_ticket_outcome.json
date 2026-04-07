@@ -1,0 +1,6 @@
+{
+  "ticket_id": "INC-2042",
+  "status": "resolved",
+  "resolution_notes": "Increased app pool max from 100 to 150 after confirming DB max_connections headroom; deployed hotfix for connection leak in batch worker.",
+  "actual_root_cause": "Connection pool too small for traffic plus a leak in worker-indexer leaving connections open under error paths."
+}

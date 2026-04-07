@@ -1,34 +1,95 @@
 # AI Incident Intelligence
 
-Python toolkit that ingests **system logs**, runs **LLM-based incident analysis**, and produces a **Markdown incident report** plus **structured support ticket** fields (title, description, severity, suggested actions). Uses the **OpenAI API** by default.
+Python toolkit that ingests **system logs**, runs **LLM incident analysis** with optional **RAG grounding** (runbooks in ChromaDB) and an optional **ticket-outcome feedback loop**, then emits a **Markdown report** and **structured JSON** for ITSM / SOAR (title, description, severity, confidence, action tier, suggested actions, lessons learned).
+
+## Deliberate scope (vs enterprise products)
+
+Products like **IBM AIOps** or **incident.io** ship deep integrations (Slack, PagerDuty, Grafana, SSO, multi-tenant scale). This repo is a **portfolio-grade, inspectable pipeline**: same *shape* of workflow (detect → triage → document → ticket), with **clear extension seams** for webhooks and agents. It does **not** try to match their integration surface—that gap is acknowledged by design.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph ingest[Ingestion]
+    L[Log file]
+    P[parse_logs]
+  end
+  subgraph ground[Optional RAG]
+    R[Runbooks .md]
+    C[(ChromaDB)]
+    Q[retrieve snippets]
+  end
+  subgraph ai[Analysis]
+    A1[LLM structured JSON]
+    A2[Optional refine from ticket outcome]
+  end
+  subgraph out[Outputs]
+    MD[Markdown report]
+    TJ[Ticket JSON / text]
+  end
+  L --> P
+  R --> C
+  P --> Q
+  C --> Q
+  P --> A1
+  Q --> A1
+  A1 --> A2
+  A2 --> MD
+  A2 --> TJ
+```
+
+**Agentic loop (extensible):** `workflow/feedback_loop.py` implements a **second-pass** model call when a ticket is resolved (`--ticket-outcome`).  
+
+**LangGraph workflow:** `workflow/langgraph_incident.py` compiles a small graph — **ingest → analyze → `poll_ticket_stub` → refine** — same outputs as the linear CLI. Run:
+
+```powershell
+pip install -r requirements-langgraph.txt
+$env:AI_INCIDENT_USE_STUB="1"
+python main.py --langgraph --log examples/sample_logs.txt --ticket-outcome examples/sample_ticket_outcome.json
+```
+
+`poll_ticket_stub` is the integration seam (replace with Jira/ServiceNow polling or a webhook handler). Use a **clean venv** if your global `langchain` packages conflict with `langgraph`.
 
 ## Workflow
 
 ```text
-logs → parse → LLM analysis → Markdown report → support ticket
+logs → parse → [optional RAG] → LLM analysis → [optional ticket feedback] → report + ticket JSON
 ```
 
-The CLI (`main.py`) runs this end-to-end. You can also import individual modules (see below).
+## Structured outputs (enterprise-style)
+
+The model returns JSON aligned for downstream systems:
+
+| Field | Meaning |
+|--------|--------|
+| `severity_level` | `LOW` / `MEDIUM` / `HIGH` / `CRITICAL` |
+| `confidence_score` | `0.0`–`1.0` (model self-assessment) |
+| `action_tier` | `P1`–`P4` (operational escalation hint) |
+| `recommended_actions` | Action list |
+| `lessons_learned` | Populated especially after `--ticket-outcome` refinement |
+
+CLI: `--out-analysis-json` and `--out-ticket-json` write these to disk.
 
 ## Project layout
 
 | Path | Purpose |
 |------|---------|
-| `ingestion/log_parser.py` | Parse lines into `LogEntry` (timestamps, `[LEVEL]`, `LEVEL: msg`, `LEVEL msg`) |
-| `ingestion/event_extractor.py` | Filter errors/warnings; JSON payloads |
-| `analysis/incident_analyzer.py` | LLM → `IncidentFinding` (legacy richer schema) |
-| `analysis/structured_incident_llm.py` | LLM → `StructuredIncidentAnalysis` (summary, root cause, severity, actions) |
-| `reporting/report_generator.py` | Report from `IncidentFinding` + optional LLM polish |
-| `reporting/structured_incident_markdown.py` | Format structured analysis → Markdown report |
-| `tickets/ticket_generator.py` | `SupportTicket` from `IncidentFinding` + optional LLM |
-| `tickets/incident_report_ticket.py` | Report / analysis → `StructuredSupportTicket` |
-| `examples/sample_logs.txt` | Sample logs |
-| `main.py` | Full pipeline CLI |
+| `ingestion/` | Log parsing, important-events JSON |
+| `grounding/` | Chroma runbook ingest + retrieval |
+| `analysis/` | OpenAI structured incident JSON |
+| `workflow/` | Ticket-outcome refinement; `langgraph_incident.py` (optional graph) |
+| `pipeline_result.py` | Shared `PipelineResult` for linear + LangGraph paths |
+| `requirements-langgraph.txt` | Optional: LangGraph (use with `--langgraph`) |
+| `reporting/` | Markdown report |
+| `tickets/` | Structured ticket + paste-friendly text |
+| `main.py` | CLI + `run_pipeline()` |
+| `examples/runbooks/` | Sample runbook for RAG demos |
+| `examples/sample_ticket_outcome.json` | Sample closure payload for refinement |
 
 ## Requirements
 
-- Python 3.10+ recommended  
-- `pip install -r requirements.txt` (installs `openai`)
+- Python 3.10+
+- `pip install -r requirements.txt` → `openai`, `chromadb` (Chroma only used when `--runbook-dir` is set)
 
 ## Setup
 
@@ -39,81 +100,89 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### Environment variables
+### Environment
 
 | Variable | Purpose |
 |----------|---------|
-| `OPENAI_API_KEY` | Required for live LLM calls (unless stub mode). Strip trailing newlines/spaces. |
+| `OPENAI_API_KEY` | Live LLM (strip trailing newline) |
 | `OPENAI_MODEL` | Optional; default `gpt-4o-mini` |
-| `AI_INCIDENT_USE_STUB` | Set to `1` / `true` / `yes` for **no API calls** — fixed demo analysis |
+| `AI_INCIDENT_USE_STUB` | `1` / `true` — no API calls |
+
+## How to run locally
 
 ```powershell
-$env:OPENAI_API_KEY="sk-..."
-$env:OPENAI_MODEL="gpt-4o-mini"   # optional
-```
-
-## CLI usage
-
-Default log file: `examples/sample_logs.txt`.
-
-```powershell
-python main.py
-python main.py examples/sample_logs.txt
-python main.py --log examples/sample_logs.txt
-python main.py -l examples/sample_logs.txt
-```
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `--log`, `-l PATH` | Log file (overrides positional path) |
-| `--max-llm-lines N` | Max lines sent in the analysis prompt (default `200`) |
-| `--max-report-log-lines N` | Max lines in the report log excerpt (default `80`) |
-| `--out-report PATH` | Write Markdown report |
-| `--out-ticket PATH` | Write ticket text (`format_text`) |
-| `--out-ticket-json PATH` | Write ticket as JSON (`title`, `description`, `severity`, `suggested_actions`) |
-| `-q`, `--quiet` | Only write `--out-*` files; no stdout |
-
-### Examples
-
-```powershell
-# Offline demo (no API key)
+# Demo without API key
 $env:AI_INCIDENT_USE_STUB="1"
 python main.py --log examples/sample_logs.txt
 
-# Production-style: save artifacts
-python main.py --log examples/sample_logs.txt --out-report report.md --out-ticket ticket.txt --out-ticket-json ticket.json
+# Optional: ground analysis on runbooks (needs chromadb)
+python main.py --log examples/sample_logs.txt --runbook-dir examples/runbooks
 
-# Quiet run
-python main.py -l examples/sample_logs.txt --out-report report.md -q
+# Optional: refine using a “resolved ticket” JSON (feedback loop)
+python main.py --log examples/sample_logs.txt --ticket-outcome examples/sample_ticket_outcome.json
+
+# Save artifacts
+python main.py --log examples/sample_logs.txt --out-report report.md --out-ticket-json ticket.json --out-analysis-json analysis.json -q
 ```
 
-## Programmatic use
+Other flags: `--max-llm-lines`, `--max-report-log-lines`, `--chroma-path`, `-q` / `--quiet`.
+
+## Sample log input (excerpt)
+
+```text
+2025-04-06T14:22:07Z [ERROR] postgres-primary[18234]: connection pool exhausted active=100 max=100
+2025-04-06T14:22:08Z [ERROR] api-gateway: request failed path=/v1/orders status=503 trace_id=a1b2c3
+ERROR Database connection timeout
+```
+
+(Full file: `examples/sample_logs.txt`.)
+
+## Sample Markdown report (stub / truncated)
+
+```markdown
+# Incident Report
+
+## Severity
+**HIGH**
+
+## Confidence score
+**0.78** _(0–1; model self-assessment, not a statistical guarantee)_
+
+## Action tier (P1–P4)
+**P2** — P1 immediate / exec risk, P2 urgent engineering, P3 standard queue, P4 informational.
+
+## Incident summary
+Multiple API errors and database connection limits observed…
+```
+
+## Sample ticket JSON (shape)
+
+```json
+{
+  "title": "[HIGH] Multiple API errors and database connection limits…",
+  "severity": "HIGH",
+  "confidence_score": 0.78,
+  "action_tier": "P2",
+  "suggested_actions": ["Inspect DB max connections…"],
+  "lessons_learned": "",
+  "description": "…"
+}
+```
+
+## Programmatic API
 
 ```python
 from pathlib import Path
 from main import run_pipeline
 
-report_md, ticket = run_pipeline(Path("examples/sample_logs.txt"))
-print(ticket.to_json())
+r = run_pipeline(
+    Path("examples/sample_logs.txt"),
+    runbook_dir=Path("examples/runbooks"),
+    ticket_outcome_path=Path("examples/sample_ticket_outcome.json"),
+)
+print(r.analysis.to_dict())
+print(r.ticket.to_dict())
 ```
-
-Other entry points:
-
-- `ingestion.parse_logs`, `ingestion.parse_log_file_to_events_json`
-- `analysis.analyze_parsed_logs`, `analysis.analyze_logs`
-- `reporting.format_structured_incident_markdown`
-- `tickets.incident_analysis_to_structured_ticket`
-
-## Log formats (parser)
-
-The parser recognizes common patterns, including:
-
-- ISO-ish timestamps at line start  
-- `[INFO]`, `[ERROR]`, …  
-- `LEVEL: message`  
-- `LEVEL message` (space-separated, no colon)
 
 ## License
 

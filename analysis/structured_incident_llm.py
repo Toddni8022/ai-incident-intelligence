@@ -51,6 +51,32 @@ def _normalize_root_cause(value: Any) -> str:
     return str(value).strip()
 
 
+def _parse_confidence(value: Any) -> float:
+    """Normalize model confidence to ``0.0``–``1.0``."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        x = float(value)
+        if x > 1.0:
+            x = x / 100.0
+        return max(0.0, min(1.0, x))
+    s = str(value).strip().rstrip("%")
+    try:
+        x = float(s)
+        if x > 1.0:
+            x = x / 100.0
+        return max(0.0, min(1.0, x))
+    except ValueError:
+        return 0.0
+
+
+def _parse_action_tier(value: Any) -> str:
+    t = str(value or "").strip().upper()
+    if t in ("P1", "P2", "P3", "P4"):
+        return t
+    return "P3"
+
+
 @dataclass
 class StructuredIncidentAnalysis:
     """Structured LLM output for log-based incident triage."""
@@ -59,15 +85,21 @@ class StructuredIncidentAnalysis:
     possible_root_cause: str
     severity_level: str
     recommended_actions: List[str] = field(default_factory=list)
+    confidence_score: float = 0.0
+    action_tier: str = "P3"
+    lessons_learned: str = ""
     raw_model_response: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        """JSON-serializable mapping with stable keys."""
+        """JSON-serializable mapping with stable keys for downstream SOAR / ITSM."""
         return {
             "incident_summary": self.incident_summary,
             "possible_root_cause": self.possible_root_cause,
             "severity_level": self.severity_level,
             "recommended_actions": list(self.recommended_actions),
+            "confidence_score": round(self.confidence_score, 4),
+            "action_tier": self.action_tier,
+            "lessons_learned": self.lessons_learned,
         }
 
     def to_json(self, *, indent: Optional[int] = 2, ensure_ascii: bool = False) -> str:
@@ -91,19 +123,28 @@ def _stub_analysis() -> StructuredIncidentAnalysis:
             "Check payments service latency and error rates.",
             "Review recent deploys and scale or fail over if needed.",
         ],
+        confidence_score=0.78,
+        action_tier="P2",
+        lessons_learned="",
         raw_model_response="",
     )
 
 
 _SYSTEM_PROMPT = (
-    "You are an SRE assistant. Given parsed system log lines, assess whether there "
-    "is an incident or notable risk. Reply with one JSON object only, using these "
-    "exact keys: "
+    "You are an SRE assistant. Given parsed system log lines (and any organization "
+    "context provided), assess whether there is an incident or notable risk. "
+    "Reply with one JSON object only, using these exact keys: "
     "incident_summary (string), "
     "possible_root_cause (string — single concise hypothesis; if multiple, combine briefly), "
     "severity_level (one of: LOW, MEDIUM, HIGH, CRITICAL), "
-    "recommended_actions (array of short actionable strings). "
-    "If logs appear healthy, set severity_level to LOW and state that in incident_summary."
+    "recommended_actions (array of short actionable strings), "
+    "confidence_score (number from 0 to 1 — your confidence in severity and root cause), "
+    "action_tier (P1|P2|P3|P4 — P1 immediate all-hands / exec risk, P2 urgent engineering, "
+    "P3 standard queue, P4 informational follow-up), "
+    "lessons_learned (string; empty \"\" if none yet). "
+    "If logs appear healthy, set severity_level to LOW, confidence_score high for that "
+    "assessment, action_tier P4, and explain briefly in incident_summary. "
+    "Ground claims in the logs and context; do not invent timestamps or systems not present."
 )
 
 
@@ -137,14 +178,32 @@ def _parse_llm_payload(data: Dict[str, Any]) -> StructuredIncidentAnalysis:
         ),
         severity_level=sev,
         recommended_actions=actions,
+        confidence_score=_parse_confidence(data.get("confidence_score")),
+        action_tier=_parse_action_tier(data.get("action_tier")),
+        lessons_learned=str(data.get("lessons_learned") or ""),
         raw_model_response=raw,
     )
+
+
+def structured_incident_from_llm_dict(data: Dict[str, Any]) -> StructuredIncidentAnalysis:
+    """Parse a model JSON object into :class:`StructuredIncidentAnalysis` (workflows, tests)."""
+    return _parse_llm_payload(data)
+
+
+def completion_json(system: str, user: str) -> Dict[str, Any]:
+    """
+    Run a single OpenAI chat completion with JSON object output.
+
+    Used by workflow modules (e.g. feedback refinement). Requires ``OPENAI_API_KEY``.
+    """
+    return _call_openai_json(system, user)
 
 
 def analyze_parsed_logs(
     entries: List[LogEntry],
     *,
     max_context_lines: int = 200,
+    grounding_context: Optional[str] = None,
 ) -> StructuredIncidentAnalysis:
     """
     Send compact parsed log lines to the LLM and return structured fields.
@@ -155,6 +214,9 @@ def analyze_parsed_logs(
         Result of :func:`ingestion.log_parser.parse_logs`.
     max_context_lines
         Cap on lines sent in the prompt (keeps newest lines if truncated).
+    grounding_context
+        Optional runbook / retrieval text (RAG) to ground the model; kept separate
+        from raw logs so callers can trace provenance.
 
     Returns
     -------
@@ -181,7 +243,16 @@ def analyze_parsed_logs(
         )
 
     context = _entries_to_log_context(entries, max_context_lines)
-    user = f"Parsed log data:\n\n{context}"
+    if grounding_context and grounding_context.strip():
+        user = (
+            "Organization knowledge (runbooks, past notes — use only to ground patterns; "
+            "do not override facts visible in logs):\n\n"
+            f"{grounding_context.strip()}\n\n"
+            "---\n\n"
+            f"Parsed log data:\n\n{context}"
+        )
+    else:
+        user = f"Parsed log data:\n\n{context}"
     data = _call_openai_json(_SYSTEM_PROMPT, user)
     return _parse_llm_payload(data)
 
@@ -249,3 +320,12 @@ def analyze_event_extractor_payload(
     user = f"{header}Important events:\n\n{context or '(no important events)'}"
     data = _call_openai_json(_SYSTEM_PROMPT, user)
     return _parse_llm_payload(data)
+
+
+def analyze_parsed_logs_with_grounding(
+    entries: List[LogEntry],
+    grounding_context: str,
+    **kwargs: Any,
+) -> StructuredIncidentAnalysis:
+    """Convenience wrapper: same as :func:`analyze_parsed_logs` with *grounding_context* set."""
+    return analyze_parsed_logs(entries, grounding_context=grounding_context, **kwargs)

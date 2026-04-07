@@ -126,6 +126,9 @@ class StructuredSupportTicket:
     description: str
     severity: str
     suggested_actions: List[str] = field(default_factory=list)
+    confidence_score: float = 0.0
+    action_tier: str = "P3"
+    lessons_learned: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-serializable dict for APIs and tooling."""
@@ -134,6 +137,9 @@ class StructuredSupportTicket:
             "description": self.description,
             "severity": self.severity,
             "suggested_actions": list(self.suggested_actions),
+            "confidence_score": round(self.confidence_score, 4),
+            "action_tier": self.action_tier,
+            "lessons_learned": self.lessons_learned,
         }
 
     def to_json(self, *, indent: Optional[int] = 2, ensure_ascii: bool = False) -> str:
@@ -142,12 +148,18 @@ class StructuredSupportTicket:
     def format_text(self) -> str:
         """Single block suitable for copy-paste into a ticket system."""
         actions = "\n".join(f"- {a}" for a in self.suggested_actions) or "- _None_"
+        tail = ""
+        if (self.lessons_learned or "").strip():
+            tail = f"\n## Lessons learned\n\n{self.lessons_learned.strip()}\n"
         return (
             f"Title: {self.title}\n"
             f"Severity: {self.severity}\n"
+            f"Confidence: {self.confidence_score:.2f}\n"
+            f"Action tier: {self.action_tier}\n"
             f"\n---\n\n"
             f"## Description\n\n{self.description}\n\n"
             f"## Suggested actions\n\n{actions}\n"
+            f"{tail}"
         )
 
 
@@ -183,11 +195,18 @@ def incident_analysis_to_structured_ticket(
         if not isinstance(actions, list):
             actions = [str(actions)]
         actions = [str(a).strip() for a in actions if str(a).strip()]
+        try:
+            conf = float(analysis.get("confidence_score") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
         obj = StructuredIncidentAnalysis(
             incident_summary=summary,
             possible_root_cause=root,
             severity_level=severity,
             recommended_actions=actions,
+            confidence_score=conf,
+            action_tier=str(analysis.get("action_tier") or "P3"),
+            lessons_learned=str(analysis.get("lessons_learned") or ""),
         )
     else:
         obj = analysis
@@ -200,6 +219,9 @@ def incident_analysis_to_structured_ticket(
         description=description,
         severity=sev,
         suggested_actions=list(obj.recommended_actions),
+        confidence_score=float(obj.confidence_score),
+        action_tier=str(obj.action_tier or "P3").upper(),
+        lessons_learned=str(obj.lessons_learned or ""),
     )
 
 
@@ -230,6 +252,9 @@ def incident_report_markdown_to_structured_ticket(
         description=description,
         severity=severity,
         suggested_actions=actions,
+        confidence_score=0.0,
+        action_tier="P3",
+        lessons_learned="",
     )
 
 
@@ -273,9 +298,24 @@ def incident_report_to_structured_ticket(
     final_actions = acts if acts else ticket.suggested_actions
     summary_for_title = _first_line(a_summary) or _first_line(parsed_summary) or "Incident"
 
+    if isinstance(analysis, dict):
+        try:
+            conf = float(analysis.get("confidence_score") or 0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        tier = str(analysis.get("action_tier") or ticket.action_tier).upper()
+        lessons = str(analysis.get("lessons_learned") or "")
+    else:
+        conf = float(analysis.confidence_score)
+        tier = str(analysis.action_tier or ticket.action_tier).upper()
+        lessons = str(analysis.lessons_learned or "")
+
     return StructuredSupportTicket(
         title=_build_title(final_sev, summary_for_title, max_len=title_max_len),
         description=ticket.description,
         severity=final_sev,
         suggested_actions=final_actions,
+        confidence_score=conf,
+        action_tier=tier or ticket.action_tier,
+        lessons_learned=lessons or ticket.lessons_learned,
     )

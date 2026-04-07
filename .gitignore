@@ -22,6 +22,9 @@ ticket.txt
 ticket.json
 *.local.md
 
+# Chroma persistence (local embeddings)
+data/chroma_incidents/
+
 # Editors / OS
 .idea/
 .vscode/

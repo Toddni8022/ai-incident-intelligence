@@ -87,12 +87,21 @@ def format_structured_incident_markdown(
         if not isinstance(actions, list):
             actions = [str(actions)]
         raw_resp = str(analysis.get("raw_model_response") or "")
+        try:
+            confidence = float(analysis.get("confidence_score") or 0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        action_tier = str(analysis.get("action_tier") or "P3").upper()
+        lessons = str(analysis.get("lessons_learned") or "")
     else:
         summary = analysis.incident_summary
         root = analysis.possible_root_cause
         severity = analysis.severity_level.upper()
         actions = list(analysis.recommended_actions)
         raw_resp = analysis.raw_model_response
+        confidence = float(analysis.confidence_score)
+        action_tier = str(analysis.action_tier or "P3").upper()
+        lessons = analysis.lessons_learned
 
     when = generated_at
     if when is None:
@@ -129,6 +138,19 @@ def format_structured_incident_markdown(
             "## Severity",
             "",
             f"**{severity}**",
+            "",
+            "## Confidence score",
+            "",
+            f"**{confidence:.2f}** _(0–1; model self-assessment, not a statistical guarantee)_",
+            "",
+            "## Action tier (P1–P4)",
+            "",
+            f"**{action_tier}** — P1 immediate / exec risk, P2 urgent engineering, "
+            "P3 standard queue, P4 informational.",
+            "",
+            "## Lessons learned",
+            "",
+            _md_paragraph(lessons),
             "",
             "## Possible root cause",
             "",

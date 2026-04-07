@@ -1,21 +1,29 @@
 """
 AI Incident Intelligence — end-to-end CLI.
 
-Runs the full pipeline:
+Runs the full pipeline (with optional **RAG** grounding and **ticket-outcome** refinement):
 
-1. **Parse logs** — structured :class:`~ingestion.log_parser.LogEntry` rows
-2. **Analyze incidents** — LLM → :class:`~analysis.structured_incident_llm.StructuredIncidentAnalysis`
-3. **Generate report** — Markdown via :mod:`reporting.structured_incident_markdown`
-4. **Create support ticket** — :class:`~tickets.incident_report_ticket.StructuredSupportTicket`
+1. **Parse logs**
+2. **Analyze incidents** (optional Chroma runbooks + optional post-ticket refinement)
+3. **Generate report** (Markdown)
+4. **Create support ticket** (structured fields + JSON)
 
 Run from the project root::
 
-    python main.py examples/sample_logs.txt
     python main.py --log examples/sample_logs.txt
 
-Offline demo (no API key)::
+    # Ground with local runbooks (requires: pip install chromadb)
+    python main.py --log examples/sample_logs.txt --runbook-dir examples/runbooks
 
-    $env:AI_INCIDENT_USE_STUB="1"   # PowerShell
+    # Refine analysis using a resolved ticket (feedback loop)
+    python main.py --log examples/sample_logs.txt --ticket-outcome examples/sample_ticket_outcome.json
+
+    # Same pipeline via LangGraph (pip install -r requirements-langgraph.txt)
+    python main.py --langgraph --log examples/sample_logs.txt
+
+Offline demo::
+
+    $env:AI_INCIDENT_USE_STUB="1"
     python main.py
 """
 
@@ -24,6 +32,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
+
+from pipeline_result import PipelineResult
 
 
 def _read_log_path(path: Path) -> str:
@@ -39,26 +50,35 @@ def run_pipeline(
     *,
     max_context_lines: int = 200,
     max_report_log_lines: int = 80,
-) -> tuple[str, "StructuredSupportTicket"]:
+    runbook_dir: Optional[Path] = None,
+    chroma_path: Optional[Path] = None,
+    ticket_outcome_path: Optional[Path] = None,
+) -> PipelineResult:
     """
-    Execute parse → analyze → Markdown report → structured ticket.
+    Parse logs → analyze (optional RAG + optional ticket refinement) → report → ticket.
 
     Parameters
     ----------
     log_path
-        Path to the log file (used as ``source`` metadata in the report).
+        Log file path (shown as report ``source``).
     max_context_lines
-        Max log lines sent to the incident LLM.
+        Lines sent to the LLM and used in refinement excerpt.
     max_report_log_lines
-        Max log lines embedded in the report excerpt.
+        Lines embedded in the Markdown report excerpt.
+    runbook_dir
+        If set, ingest ``*.md`` / ``*.txt`` into Chroma and retrieve snippets for grounding.
+    chroma_path
+        Chroma persistence directory (default: ``data/chroma_incidents``).
+    ticket_outcome_path
+        If set, load JSON outcome and run a second LLM pass to calibrate analysis.
 
     Returns
     -------
-    tuple[str, StructuredSupportTicket]
-        ``(report_markdown, ticket)``.
+    PipelineResult
+        Report Markdown, structured ticket, and final :class:`StructuredIncidentAnalysis`.
     """
     from analysis.structured_incident_llm import analyze_parsed_logs
-    from ingestion.log_parser import parse_logs
+    from ingestion.log_parser import entries_to_context, parse_logs
     from reporting.structured_incident_markdown import format_structured_incident_markdown
     from tickets.incident_report_ticket import incident_analysis_to_structured_ticket
 
@@ -67,7 +87,48 @@ def run_pipeline(
     if not entries:
         raise ValueError("No log lines parsed.")
 
-    analysis = analyze_parsed_logs(entries, max_context_lines=max_context_lines)
+    grounding = ""
+    if runbook_dir is not None:
+        from grounding.rag_store import (
+            build_log_query_for_retrieval,
+            ingest_runbook_directory,
+            is_rag_available,
+            retrieve_grounding_context,
+        )
+
+        if not is_rag_available():
+            print(
+                "Warning: --runbook-dir set but chromadb is not installed. "
+                "Run: pip install chromadb",
+                file=sys.stderr,
+            )
+        else:
+            persist = chroma_path or Path("data/chroma_incidents")
+            try:
+                n = ingest_runbook_directory(runbook_dir, persist)
+                if n:
+                    print(
+                        f"Ingested {n} runbook file(s) → {persist.resolve()}",
+                        file=sys.stderr,
+                    )
+            except OSError as e:
+                print(f"Warning: runbook ingest failed: {e}", file=sys.stderr)
+            q = build_log_query_for_retrieval(entries, max_lines=40)
+            grounding = retrieve_grounding_context(q, persist, n_results=5)
+
+    analysis = analyze_parsed_logs(
+        entries,
+        max_context_lines=max_context_lines,
+        grounding_context=grounding or None,
+    )
+
+    if ticket_outcome_path is not None:
+        from workflow.feedback_loop import load_ticket_outcome, refine_analysis_with_outcome
+
+        excerpt = entries_to_context(entries, max_lines=max_context_lines)
+        outcome = load_ticket_outcome(ticket_outcome_path)
+        analysis = refine_analysis_with_outcome(analysis, outcome, excerpt)
+
     source = str(log_path.resolve())
     report_md = format_structured_incident_markdown(
         analysis,
@@ -79,27 +140,19 @@ def run_pipeline(
         analysis,
         report_markdown=report_md,
     )
-    return report_md, ticket
+    return PipelineResult(
+        report_markdown=report_md,
+        ticket=ticket,
+        analysis=analysis,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
-    """
-    Parse CLI arguments, run the full pipeline, print report and ticket to stdout.
-
-    Parameters
-    ----------
-    argv
-        Optional argument list (defaults to ``sys.argv[1:]``).
-
-    Returns
-    -------
-    int
-        Process exit code (0 on success).
-    """
+    """CLI entrypoint."""
     parser = argparse.ArgumentParser(
         description=(
-            "Full pipeline: parse logs → analyze incidents → Markdown report → "
-            "support ticket."
+            "Full pipeline: parse logs → analyze (optional RAG / ticket feedback) → "
+            "Markdown report → support ticket."
         ),
     )
     parser.add_argument(
@@ -132,6 +185,35 @@ def main(argv: list[str] | None = None) -> int:
         help="Max log lines in the report excerpt (default: 80).",
     )
     parser.add_argument(
+        "--runbook-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Directory of .md/.txt runbooks to ingest into Chroma (optional RAG).",
+    )
+    parser.add_argument(
+        "--chroma-path",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Chroma persistence path (default: data/chroma_incidents).",
+    )
+    parser.add_argument(
+        "--ticket-outcome",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help="Ticket resolution JSON for second-pass refinement (feedback loop).",
+    )
+    parser.add_argument(
+        "--langgraph",
+        action="store_true",
+        help=(
+            "Run the same stages through a LangGraph workflow (ingest → analyze → "
+            "stub ticket poll → refine). Requires requirements-langgraph.txt."
+        ),
+    )
+    parser.add_argument(
         "--out-report",
         type=Path,
         default=None,
@@ -147,7 +229,13 @@ def main(argv: list[str] | None = None) -> int:
         "--out-ticket-json",
         type=Path,
         default=None,
-        help="Write support ticket fields as JSON to this file.",
+        help="Write support ticket fields as JSON.",
+    )
+    parser.add_argument(
+        "--out-analysis-json",
+        type=Path,
+        default=None,
+        help="Write structured analysis JSON (severity, confidence, action_tier, …).",
     )
     parser.add_argument(
         "-q",
@@ -159,26 +247,49 @@ def main(argv: list[str] | None = None) -> int:
     log_path = args.log if args.log is not None else args.log_file
 
     try:
-        report_md, ticket = run_pipeline(
-            log_path,
-            max_context_lines=args.max_llm_lines,
-            max_report_log_lines=args.max_report_log_lines,
-        )
+        if args.langgraph:
+            from workflow.langgraph_incident import run_langgraph_incident
+
+            result = run_langgraph_incident(
+                log_path,
+                max_context_lines=args.max_llm_lines,
+                max_report_log_lines=args.max_report_log_lines,
+                runbook_dir=args.runbook_dir,
+                chroma_path=args.chroma_path,
+                ticket_outcome_path=args.ticket_outcome,
+            )
+        else:
+            result = run_pipeline(
+                log_path,
+                max_context_lines=args.max_llm_lines,
+                max_report_log_lines=args.max_report_log_lines,
+                runbook_dir=args.runbook_dir,
+                chroma_path=args.chroma_path,
+                ticket_outcome_path=args.ticket_outcome,
+            )
     except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    except ImportError as e:
         print(str(e), file=sys.stderr)
         return 1
 
     if args.out_report:
-        args.out_report.write_text(report_md, encoding="utf-8")
+        args.out_report.write_text(result.report_markdown, encoding="utf-8")
     if args.out_ticket:
-        args.out_ticket.write_text(ticket.format_text(), encoding="utf-8")
+        args.out_ticket.write_text(result.ticket.format_text(), encoding="utf-8")
     if args.out_ticket_json:
-        args.out_ticket_json.write_text(ticket.to_json(), encoding="utf-8")
+        args.out_ticket_json.write_text(result.ticket.to_json(), encoding="utf-8")
+    if args.out_analysis_json:
+        args.out_analysis_json.write_text(
+            result.analysis.to_json(),
+            encoding="utf-8",
+        )
 
     if not args.quiet:
-        print(report_md)
+        print(result.report_markdown)
         print("\n" + "=" * 60 + "\n")
-        print(ticket.format_text())
+        print(result.ticket.format_text())
 
     return 0
 
