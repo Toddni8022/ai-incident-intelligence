@@ -15,5 +15,5 @@ jobs:
           cache: pip
       - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q analysis grounding ingestion reporting tickets workflow
-      - run: pytest -q
+      - run: python -m pytest -q
       - run: AI_INCIDENT_USE_STUB=1 python main.py --log examples/sample_logs.txt -q
