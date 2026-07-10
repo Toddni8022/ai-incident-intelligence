@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m compileall -q analysis grounding ingestion reporting tickets workflow
+      - run: python -m pytest -q
+      - run: AI_INCIDENT_USE_STUB=1 python main.py --log examples/sample_logs.txt -q

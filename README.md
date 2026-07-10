@@ -186,4 +186,17 @@ print(r.ticket.to_dict())
 
 ## License
 
-Use and modify freely for your own operations.
+MIT. See `LICENSE`.
+
+## Verification
+
+The default automated suite is fully offline and never requires an API key:
+
+```powershell
+pip install -r requirements-dev.txt
+pytest -q
+$env:AI_INCIDENT_USE_STUB="1"
+python main.py --log examples/sample_logs.txt -q
+```
+
+GitHub Actions runs the parser, normalization, structured ticket, report, and end-to-end stub pipeline checks for every push and pull request.
