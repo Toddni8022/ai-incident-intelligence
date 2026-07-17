@@ -1,5 +1,5 @@
 """
-LangGraph agent workflow: ingest → LLM analyze → stub ticket poll → refine.
+LangGraph agent workflow: ingest → LLM analyze → ticket poll → refine.
 
 Install optional deps::
 
@@ -10,15 +10,18 @@ Run via CLI::
     python main.py --langgraph --log examples/sample_logs.txt \\
         --ticket-outcome examples/sample_ticket_outcome.json
 
-The ``poll_ticket_stub`` node is a **placeholder** for Jira / ServiceNow / PagerDuty
-webhooks; swap its implementation without changing graph topology.
+The ``poll_ticket_stub`` node is the integration seam for Jira / ServiceNow /
+PagerDuty: when ``AI_INCIDENT_TICKET_API_BASE`` is set (and stub mode is off) it
+polls the real ticket API via :func:`workflow.ticket_poller.poll_ticket_outcome`;
+otherwise it keeps the offline stub behavior. Graph topology is unchanged either way.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict, cast
+from typing import Any, Dict, NotRequired, Optional, TypedDict, cast
 
 from pipeline_result import PipelineResult
 
@@ -32,10 +35,12 @@ class IncidentGraphState(TypedDict, total=False):
     runbook_dir: NotRequired[str]
     chroma_path: NotRequired[str]
     ticket_outcome_file: NotRequired[str]
+    ticket_id: NotRequired[str]
     entries: Any
     grounding: str
     analysis: Any
     poll_note: str
+    polled_ticket_outcome: NotRequired[Dict[str, Any]]
     refined_analysis: Any
 
 
@@ -110,41 +115,95 @@ def analyze_node(state: IncidentGraphState) -> dict[str, Any]:
     return {"analysis": analysis}
 
 
+def _ticket_id_from_outcome_file(path: Optional[str]) -> Optional[str]:
+    """Best-effort ``ticket_id`` extraction from a ticket-outcome JSON file."""
+    if not path:
+        return None
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and data.get("ticket_id"):
+        return str(data["ticket_id"])
+    return None
+
+
 def poll_ticket_stub_node(state: IncidentGraphState) -> dict[str, Any]:
     """
-    Stub integration point: in production, poll or await webhook for ticket status.
+    Ticket-monitor seam: poll ITSM for closure, or record stub intent offline.
 
-    Here we only record intent; actual outcome is still read from *ticket_outcome_file*
-    in the next node (file-based demo).
+    When ``AI_INCIDENT_TICKET_API_BASE`` is configured and stub mode is off, this
+    node polls the live ticket API (:func:`workflow.ticket_poller.poll_ticket_outcome`)
+    and stores the terminal ticket payload under ``polled_ticket_outcome`` for
+    :func:`refine_node`. The ticket id comes from ``state['ticket_id']`` or the
+    ``ticket_id`` key of the ``--ticket-outcome`` JSON file.
+
+    Otherwise the node is a **stub**: it only records intent, and the outcome is
+    still read from *ticket_outcome_file* in the next node (file-based demo).
     """
+    from workflow.ticket_poller import poll_ticket_outcome, real_ticket_polling_enabled
+
     p = state.get("ticket_outcome_file")
-    if p:
-        note = (
-            "Stub monitor: would poll ITSM for closure (Jira/ServiceNow). "
-            f"Demo uses static outcome file: {p}"
+
+    if not real_ticket_polling_enabled():
+        if p:
+            note = (
+                "Stub monitor: would poll ITSM for closure (Jira/ServiceNow). "
+                f"Demo uses static outcome file: {p}"
+            )
+        else:
+            note = (
+                "Stub monitor: no ticket linked; next node will pass-through without refinement."
+            )
+        return {"poll_note": note}
+
+    ticket_id = state.get("ticket_id") or _ticket_id_from_outcome_file(p)
+    if not ticket_id:
+        raise ValueError(
+            "AI_INCIDENT_TICKET_API_BASE is set but no ticket id is available: "
+            "set state['ticket_id'] or pass --ticket-outcome JSON containing 'ticket_id'."
         )
-    else:
-        note = (
-            "Stub monitor: no ticket linked; next node will pass-through without refinement."
-        )
-    return {"poll_note": note}
+    outcome = poll_ticket_outcome(ticket_id)
+    note = (
+        f"Polled ticket API for {ticket_id}: "
+        f"status={outcome.get('status', 'unknown')}"
+    )
+    return {"poll_note": note, "polled_ticket_outcome": outcome}
 
 
 def refine_node(state: IncidentGraphState) -> dict[str, Any]:
-    """Second LLM pass when a ticket outcome JSON path is provided."""
+    """
+    Second LLM pass when a ticket outcome is available.
+
+    Prefers the live ``polled_ticket_outcome`` produced by
+    :func:`poll_ticket_stub_node`; falls back to the *ticket_outcome_file* JSON.
+    """
     from ingestion.log_parser import entries_to_context
-    from workflow.feedback_loop import load_ticket_outcome, refine_analysis_with_outcome
+    from workflow.feedback_loop import (
+        TicketOutcome,
+        load_ticket_outcome,
+        refine_analysis_with_outcome,
+    )
 
     analysis = state["analysis"]
+    polled = state.get("polled_ticket_outcome")
     p = state.get("ticket_outcome_file")
-    if not p:
+    if polled is None and not p:
         return {"refined_analysis": analysis}
 
     excerpt = entries_to_context(
         state["entries"],
         max_lines=int(state.get("max_context_lines") or 200),
     )
-    outcome = load_ticket_outcome(Path(p))
+    if polled is not None:
+        outcome = TicketOutcome(
+            ticket_id=str(polled.get("ticket_id") or ""),
+            status=str(polled.get("status") or "unknown"),
+            resolution_notes=str(polled.get("resolution_notes") or ""),
+            actual_root_cause=str(polled.get("actual_root_cause") or ""),
+        )
+    else:
+        outcome = load_ticket_outcome(Path(p))
     refined = refine_analysis_with_outcome(analysis, outcome, excerpt)
     return {"refined_analysis": refined}
 
