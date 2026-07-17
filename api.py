@@ -2,7 +2,8 @@
 Optional FastAPI service wrapper around the incident pipeline.
 
 Exposes ``POST /analyze`` (multipart log-file upload **or** JSON body) and returns
-the structured analysis plus the structured ticket JSON.
+the structured analysis plus the structured ticket JSON. ``GET /health`` reports
+service status, stub-mode, RAG availability, and the service version.
 
 Install the extra dependencies and run::
 
@@ -16,11 +17,50 @@ Install the extra dependencies and run::
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 _API_INSTALL_HINT = "Run: pip install -r requirements-api.txt"
+
+APP_VERSION = "1.0.0"
+
+
+def _stub_mode_enabled() -> bool:
+    """Return True when ``AI_INCIDENT_USE_STUB`` requests offline stub responses."""
+    return os.environ.get("AI_INCIDENT_USE_STUB", "").lower() in ("1", "true", "yes")
+
+
+def _rag_available() -> bool:
+    """Return True when Chroma-backed RAG grounding is usable (guarded import)."""
+    try:
+        from grounding.rag_store import is_rag_available
+    except ImportError:
+        return False
+    try:
+        return bool(is_rag_available())
+    except Exception:  # pragma: no cover - defensive: never break /health
+        return False
+
+
+def health_payload() -> Dict[str, Any]:
+    """
+    Build the ``GET /health`` response body.
+
+    Returns
+    -------
+    dict
+        ``status`` (``"ok"``), ``version``, ``stub_mode`` (from
+        ``AI_INCIDENT_USE_STUB``), and ``rag_available`` (chromadb importable).
+        Evaluated at call time so tests/containers see current env vars.
+    """
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "stub_mode": _stub_mode_enabled(),
+        "rag_available": _rag_available(),
+    }
 
 
 def _write_temp_text(text: str, *, suffix: str, keep: List[Path]) -> Path:
@@ -68,8 +108,14 @@ def create_app() -> Any:
     app = FastAPI(
         title="AI Incident Intelligence",
         summary="Parse logs → LLM incident analysis → Markdown report + ticket JSON.",
-        version="1.0.0",
+        version=APP_VERSION,
     )
+
+    async def health() -> Dict[str, Any]:
+        """Liveness probe: status, version, stub-mode, and RAG availability."""
+        return health_payload()
+
+    app.add_api_route("/health", health, methods=["GET"])
 
     async def analyze(request: Request) -> Dict[str, Any]:
         """

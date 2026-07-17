@@ -80,3 +80,23 @@ def test_analyze_endpoint_bad_ticket_outcome_type_returns_422(monkeypatch):
     )
     assert resp.status_code == 422
     assert "ticket_outcome" in resp.json()["detail"]
+
+
+def test_health_endpoint_reports_status_version_and_modes(monkeypatch):
+    monkeypatch.setenv("AI_INCIDENT_USE_STUB", "1")
+    client = _make_client()
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "ok"
+    assert payload["version"] == api.APP_VERSION
+    assert payload["stub_mode"] is True
+    assert isinstance(payload["rag_available"], bool)
+
+
+def test_health_endpoint_stub_mode_false_when_env_unset(monkeypatch):
+    monkeypatch.delenv("AI_INCIDENT_USE_STUB", raising=False)
+    client = _make_client()
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["stub_mode"] is False
