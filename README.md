@@ -83,6 +83,8 @@ CLI: `--out-analysis-json` and `--out-ticket-json` write these to disk.
 | `reporting/` | Markdown report |
 | `tickets/` | Structured ticket + paste-friendly text |
 | `main.py` | CLI + `run_pipeline()` |
+| `api.py` | Optional FastAPI wrapper (`--serve`); lazy fastapi/uvicorn imports |
+| `requirements-api.txt` | Optional: FastAPI service mode (`--serve`) |
 | `examples/runbooks/` | Sample runbook for RAG demos |
 | `examples/sample_ticket_outcome.json` | Sample closure payload for refinement |
 
@@ -126,6 +128,28 @@ python main.py --log examples/sample_logs.txt --out-report report.md --out-ticke
 ```
 
 Other flags: `--max-llm-lines`, `--max-report-log-lines`, `--chroma-path`, `-q` / `--quiet`.
+
+## API service mode
+
+The same pipeline is available over HTTP via an optional FastAPI wrapper (`api.py`). The extra dependencies are kept separate, and `fastapi`/`uvicorn` are imported lazily — the CLI and tests work without them:
+
+```powershell
+pip install -r requirements-api.txt
+python main.py --serve --host 127.0.0.1 --port 8000
+```
+
+`POST /analyze` accepts either a JSON body (`log_text`, optional `runbook_dir`, optional inline `ticket_outcome` object) or a multipart log-file upload, and returns the structured `analysis`, structured `ticket`, and `report_markdown`. Example:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/analyze \
+  -H "Content-Type: application/json" \
+  -d '{"log_text": "2025-04-06T14:22:07Z [ERROR] postgres-primary[18234]: connection pool exhausted\nERROR Database connection timeout"}'
+
+# Or upload a log file:
+curl -s -X POST http://127.0.0.1:8000/analyze -F "file=@examples/sample_logs.txt"
+```
+
+Set `AI_INCIDENT_USE_STUB=1` before starting the server for offline demo responses.
 
 ## Sample log input (excerpt)
 

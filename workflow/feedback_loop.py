@@ -42,9 +42,31 @@ class TicketOutcome:
 
 
 def load_ticket_outcome(path: Union[str, Path]) -> TicketOutcome:
-    """Load :class:`TicketOutcome` from a JSON file."""
+    """
+    Load :class:`TicketOutcome` from a JSON file.
+
+    Missing optional keys fall back to defaults (``status`` becomes ``"unknown"``).
+
+    Raises
+    ------
+    ValueError
+        If the file cannot be read, is not valid JSON, or does not contain a
+        JSON object at the top level.
+    """
     p = Path(path)
-    data = json.loads(p.read_text(encoding="utf-8"))
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"Cannot read ticket outcome file {p}: {e}") from e
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Ticket outcome file {p} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Ticket outcome file {p} must contain a JSON object with keys such as "
+            "'status', 'ticket_id', 'resolution_notes', 'actual_root_cause'."
+        )
     return TicketOutcome(
         ticket_id=str(data.get("ticket_id") or ""),
         status=str(data.get("status") or "unknown"),

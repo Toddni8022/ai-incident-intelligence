@@ -21,6 +21,9 @@ Run from the project root::
     # Same pipeline via LangGraph (pip install -r requirements-langgraph.txt)
     python main.py --langgraph --log examples/sample_logs.txt
 
+    # Serve the pipeline over HTTP (pip install -r requirements-api.txt)
+    python main.py --serve --host 127.0.0.1 --port 8000
+
 Offline demo::
 
     $env:AI_INCIDENT_USE_STUB="1"
@@ -43,6 +46,15 @@ def _read_log_path(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except OSError as e:
         raise SystemExit(f"Cannot read log file {path}: {e}") from e
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    """Create the parent directory of *path* if needed; clear ValueError on failure."""
+    parent = path.expanduser().resolve().parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ValueError(f"Cannot create output directory {parent}: {e}") from e
 
 
 def run_pipeline(
@@ -83,9 +95,11 @@ def run_pipeline(
     from tickets.incident_report_ticket import incident_analysis_to_structured_ticket
 
     raw = _read_log_path(log_path)
+    if not raw.strip():
+        raise ValueError(f"Log file {log_path} is empty or contains only whitespace.")
     entries = parse_logs(raw)
     if not entries:
-        raise ValueError("No log lines parsed.")
+        raise ValueError(f"No log lines could be parsed from {log_path}.")
 
     grounding = ""
     if runbook_dir is not None:
@@ -243,10 +257,47 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not print report/ticket to stdout (only write --out-* files).",
     )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Run the FastAPI service wrapper (api.py) instead of a one-shot analysis.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        metavar="ADDR",
+        help="Bind address for --serve (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        metavar="N",
+        help="Bind port for --serve (default: 8000).",
+    )
     args = parser.parse_args(argv)
+
+    if args.serve:
+        try:
+            from api import serve
+
+            serve(host=args.host, port=args.port)
+        except ImportError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        return 0
+
     log_path = args.log if args.log is not None else args.log_file
 
+    out_paths = [
+        p
+        for p in (args.out_report, args.out_ticket, args.out_ticket_json, args.out_analysis_json)
+        if p is not None
+    ]
+
     try:
+        for out_path in out_paths:
+            _ensure_parent_dir(out_path)
         if args.langgraph:
             from workflow.langgraph_incident import run_langgraph_incident
 
@@ -267,24 +318,27 @@ def main(argv: list[str] | None = None) -> int:
                 chroma_path=args.chroma_path,
                 ticket_outcome_path=args.ticket_outcome,
             )
+
+        if args.out_report:
+            args.out_report.write_text(result.report_markdown, encoding="utf-8")
+        if args.out_ticket:
+            args.out_ticket.write_text(result.ticket.format_text(), encoding="utf-8")
+        if args.out_ticket_json:
+            args.out_ticket_json.write_text(result.ticket.to_json(), encoding="utf-8")
+        if args.out_analysis_json:
+            args.out_analysis_json.write_text(
+                result.analysis.to_json(),
+                encoding="utf-8",
+            )
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 1
     except ImportError as e:
         print(str(e), file=sys.stderr)
         return 1
-
-    if args.out_report:
-        args.out_report.write_text(result.report_markdown, encoding="utf-8")
-    if args.out_ticket:
-        args.out_ticket.write_text(result.ticket.format_text(), encoding="utf-8")
-    if args.out_ticket_json:
-        args.out_ticket_json.write_text(result.ticket.to_json(), encoding="utf-8")
-    if args.out_analysis_json:
-        args.out_analysis_json.write_text(
-            result.analysis.to_json(),
-            encoding="utf-8",
-        )
+    except Exception as e:  # unexpected failure: keep the CLI message clean
+        print(f"Unexpected error ({type(e).__name__}): {e}", file=sys.stderr)
+        return 2
 
     if not args.quiet:
         print(result.report_markdown)

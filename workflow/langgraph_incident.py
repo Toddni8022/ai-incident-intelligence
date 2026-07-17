@@ -55,9 +55,11 @@ def ingest_node(state: IncidentGraphState) -> dict[str, Any]:
 
     log_path = Path(state["log_file"])
     text = log_path.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"Log file {log_path} is empty or contains only whitespace.")
     entries = parse_logs(text)
     if not entries:
-        raise ValueError("No log lines parsed.")
+        raise ValueError(f"No log lines could be parsed from {log_path}.")
 
     grounding = ""
     rd = state.get("runbook_dir")
