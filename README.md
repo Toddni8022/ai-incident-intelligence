@@ -48,7 +48,7 @@ $env:AI_INCIDENT_USE_STUB="1"
 python main.py --langgraph --log examples/sample_logs.txt --ticket-outcome examples/sample_ticket_outcome.json
 ```
 
-`poll_ticket_stub` is the integration seam (replace with Jira/ServiceNow polling or a webhook handler). Use a **clean venv** if your global `langchain` packages conflict with `langgraph`.
+`poll_ticket_stub` is the integration seam: by default it keeps the offline stub behavior, but when `AI_INCIDENT_TICKET_API_BASE` is set (and stub mode is off) it polls the real ticket API (`GET {base}/tickets/{ticket_id}`, optional `AI_INCIDENT_TICKET_API_KEY` bearer) via `workflow/ticket_poller.py` and feeds the terminal outcome into refinement. Use a **clean venv** if your global `langchain` packages conflict with `langgraph`.
 
 ## Workflow
 
@@ -77,7 +77,8 @@ CLI: `--out-analysis-json` and `--out-ticket-json` write these to disk.
 | `ingestion/` | Log parsing, important-events JSON |
 | `grounding/` | Chroma runbook ingest + retrieval |
 | `analysis/` | OpenAI structured incident JSON |
-| `workflow/` | Ticket-outcome refinement; `langgraph_incident.py` (optional graph) |
+| `workflow/` | Ticket-outcome refinement; `langgraph_incident.py` (optional graph); `ticket_poller.py` (live ITSM polling w/ stub fallback) |
+| `Dockerfile` / `docker-compose.yml` | Slim API container (no chromadb); compose is optional convenience |
 | `pipeline_result.py` | Shared `PipelineResult` for linear + LangGraph paths |
 | `requirements-langgraph.txt` | Optional: LangGraph (use with `--langgraph`) |
 | `reporting/` | Markdown report |
@@ -109,6 +110,8 @@ pip install -r requirements.txt
 | `OPENAI_API_KEY` | Live LLM (strip trailing newline) |
 | `OPENAI_MODEL` | Optional; default `gpt-4o-mini` |
 | `AI_INCIDENT_USE_STUB` | `1` / `true` — no API calls |
+| `AI_INCIDENT_TICKET_API_BASE` | Optional; ticket API base URL — enables live polling in the LangGraph `poll_ticket_stub` node |
+| `AI_INCIDENT_TICKET_API_KEY` | Optional; bearer token for the ticket API |
 
 ## How to run locally
 
@@ -150,6 +153,35 @@ curl -s -X POST http://127.0.0.1:8000/analyze -F "file=@examples/sample_logs.txt
 ```
 
 Set `AI_INCIDENT_USE_STUB=1` before starting the server for offline demo responses.
+
+`GET /health` returns service status for probes/monitoring:
+
+```bash
+curl -s http://127.0.0.1:8000/health
+# {"status":"ok","version":"1.0.0","stub_mode":true,"rag_available":false}
+```
+
+## Run with Docker
+
+The root `Dockerfile` builds a slim image (python:3.12-slim, no chromadb, no LangGraph) that serves the API:
+
+```bash
+docker build -t ai-incident-intelligence .
+docker run -p 8000:8000 ai-incident-intelligence
+
+curl -s http://127.0.0.1:8000/health
+# {"status":"ok","version":"1.0.0","stub_mode":true,"rag_available":false}
+```
+
+The image defaults to `AI_INCIDENT_USE_STUB=1` so it runs offline out of the box. For live LLM analysis, pass your key and clear the stub flag:
+
+```bash
+docker run -p 8000:8000 -e AI_INCIDENT_USE_STUB= -e OPENAI_API_KEY=sk-... ai-incident-intelligence
+```
+
+`docker-compose.yml` is an optional convenience wrapper (`docker compose up --build`, port 8000, stub mode on by default).
+
+> **RAG in Docker:** the slim image intentionally omits `chromadb` (it is filtered out of `requirements.txt` at build time), so `--runbook-dir` grounding and `"rag_available": true` require a chromadb-enabled variant — build with the unfiltered `requirements.txt` (drop the `grep -vi chromadb` filter in the `Dockerfile`). The LangGraph workflow (`requirements-langgraph.txt`) is likewise a local-only extra.
 
 ## Sample log input (excerpt)
 
