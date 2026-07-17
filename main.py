@@ -224,7 +224,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Run the same stages through a LangGraph workflow (ingest → analyze → "
-            "stub ticket poll → refine). Requires requirements-langgraph.txt."
+            "ticket poll → refine). The poll node uses the live ticket API when "
+            "AI_INCIDENT_TICKET_API_BASE is set, else a stub. "
+            "Requires requirements-langgraph.txt."
         ),
     )
     parser.add_argument(
