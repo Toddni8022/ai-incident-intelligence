@@ -1,0 +1,18 @@
+# Optional convenience wrapper — the root Dockerfile alone is enough:
+#   docker build -t ai-incident-intelligence .
+#   docker run -p 8000:8000 ai-incident-intelligence
+services:
+  ai-incident-intelligence:
+    build: .
+    image: ai-incident-intelligence
+    ports:
+      - "8000:8000"
+    environment:
+      # Offline stub mode by default; set AI_INCIDENT_USE_STUB="" and provide
+      # OPENAI_API_KEY for live LLM analysis.
+      AI_INCIDENT_USE_STUB: "${AI_INCIDENT_USE_STUB:-1}"
+      # Optional: live ticket-outcome polling (LangGraph poll_ticket_stub node)
+      # AI_INCIDENT_TICKET_API_BASE: "https://itsm.example.com"
+      # AI_INCIDENT_TICKET_API_KEY: "changeme"
+      # Optional: live LLM
+      # OPENAI_API_KEY: ""
